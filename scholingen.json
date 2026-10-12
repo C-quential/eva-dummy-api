@@ -1,0 +1,27 @@
+[
+    {
+        "ID": 50101,
+        "TITLE": "BHV herhaling",
+        "LOCATION": "Trainingscentrum, lokaal 0.12"
+    },
+    {
+        "ID": 50102,
+        "TITLE": "Reanimatie (BLS/AED) herhaling",
+        "LOCATION": "Skillslab, gebouw B"
+    },
+    {
+        "ID": 50103,
+        "TITLE": "Voorbehouden handelingen: injecteren",
+        "LOCATION": "Skillslab, gebouw B"
+    },
+    {
+        "ID": 50104,
+        "TITLE": "Medicatieveiligheid",
+        "LOCATION": "Online (Teams)"
+    },
+    {
+        "ID": 50105,
+        "TITLE": "Omgaan met agressie",
+        "LOCATION": "Leslokaal 2.14, hoofdgebouw"
+    }
+]
