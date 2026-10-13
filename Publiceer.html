@@ -1,0 +1,1002 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EVA dummy-API publiceren</title>
+<!--
+    Publiceer.html
+    ==============
+    Zet de ingevulde EVA-dummy-Excel om naar de twee JSON-bestanden die Roosterplanning (RP) ophaalt als
+    "EVA endpoint scholingen" en "EVA endpoint inschrijvingen", en publiceert ze in een openbare GitHub-repo.
+    Werkt in elke recente browser (Chrome, Edge, Safari, Firefox) op Mac en Windows, zonder installatie.
+    Instellingen (repo, branch, token) staan in instellingen.js naast deze pagina.
+
+    WERKING
+     1. Excel lezen (leesXlsx()): zip + XML in de browser, alleen de tabbladen Scholingen en Inschrijvingen,
+        kolommen op naam (rij 1). Hulpkolommen worden genegeerd, lege regels tellen niet mee.
+     2. Controleren (controleerScholingen(), controleerInschrijvingen()): dezelfde regels als de kolom Controle in
+        de Excel, plus wat RP afdwingt (zie RP-GEDRAG). Bij één fout of meer kan er niet worden gepubliceerd.
+     3. Publiceren (publiceerOpGithub()): beide bestanden in één commit via de Git Data API, zodat RP nooit een half
+        bijgewerkte stand ziet. Zijn de bestanden al gelijk, dan geen commit. Publiceert iemand anders tegelijk,
+        dan opnieuw (POGINGEN).
+     4. Nacontrole (controleerOpenbaar()): beide bestanden ophalen via raw.githubusercontent.com op de nieuwe commit
+        en vergelijken. Daarmee is zeker dat de repo openbaar is en RP de inhoud kan lezen.
+    De commitberichten op GitHub zijn het publicatielog (wie, welk bestand, aantallen).
+
+    RP-GEDRAG (bevestigd in de code: laravel/app/Utilities/Eva/EvaDataProcessor.php en EvaDataRetriever.php)
+     - RP doet een GET op beide URL's en verwacht een JSON-array; bij het opslaan van de instellingen eerst een HEAD.
+       raw.githubusercontent.com geeft op beide 200 en bewaart een bestand tot 5 minuten in de cache.
+     - Scholing: ID (getal, sleutel), TITLE en LOCATION (beide NOT NULL, max. 255).
+     - Inschrijving: PERSONEELSNUMMER (deel vóór '/' of ';' van het PersonNr; onbekend = stil overgeslagen),
+       C_ID (moet een bestaande scholing zijn, anders mislukt de hele sync), BEGINTIJD/EINDTIJD (Carbon::parse in
+       Europe/Amsterdam; de datum van BEGINTIJD is de roosterdag).
+     - Elke levering is de volledige stand: wat ontbreekt, verwijdert RP.
+    Aanname (niet bekend uit een echt LMS): het tijdformaat "jjjj-mm-dd uu:mm:ss". RP leest dat zonder problemen.
+-->
+<style>
+    :root {
+        --bg: #f5f6f8; --kaart: #ffffff; --tekst: #1d2330; --zacht: #5b6475; --rand: #dde1e8;
+        --accent: #1f4e78; --accent-tekst: #ffffff; --code: #eef1f5;
+        --ok: #1e6b30; --ok-bg: #e6f4ea; --let: #7a4f00; --let-bg: #fff4d6; --fout: #a8221a; --fout-bg: #fde8e7;
+    }
+    @media (prefers-color-scheme: dark) {
+        :root {
+            --bg: #14171c; --kaart: #1d2128; --tekst: #e6e9ef; --zacht: #9aa3b2; --rand: #323844;
+            --accent: #6ea8dc; --accent-tekst: #0d1117; --code: #262b33;
+            --ok: #7dd38f; --ok-bg: #16301d; --let: #f2c46b; --let-bg: #33290f; --fout: #f28b82; --fout-bg: #3a1a18;
+        }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--tekst); font: 15px/1.5 -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
+    main { max-width: 880px; margin: 0 auto; padding: 32px 16px 48px; }
+    h1 { font-size: 24px; margin: 0 0 4px; }
+    h2 { font-size: 17px; margin: 0 0 12px; }
+    p { margin: 0 0 8px; }
+    a { color: var(--accent); }
+    .sub, .zacht { color: var(--zacht); }
+    .kaart { background: var(--kaart); border: 1px solid var(--rand); border-radius: 10px; padding: 20px; margin-top: 16px; }
+    .dropzone { display: block; border: 2px dashed var(--rand); border-radius: 10px; padding: 28px 16px; text-align: center; cursor: pointer; }
+    .dropzone.actief, .dropzone:hover { border-color: var(--accent); }
+    .dropzone input { display: none; }
+    .dropzone strong { display: block; font-size: 16px; }
+    .melding { border-radius: 8px; padding: 12px 14px; margin-top: 14px; }
+    .melding.ok { background: var(--ok-bg); color: var(--ok); }
+    .melding.let { background: var(--let-bg); color: var(--let); }
+    .melding.fout { background: var(--fout-bg); color: var(--fout); }
+    .melding.info { background: var(--code); }
+    .melding p:last-child, .melding ul:last-child { margin-bottom: 0; }
+    .melding ul { margin: 6px 0 0; padding-left: 20px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 8px; font-size: 14px; }
+    th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--rand); vertical-align: top; }
+    th { color: var(--zacht); font-weight: 600; }
+    .tabel { overflow-x: auto; }
+    details { margin-top: 14px; }
+    summary { cursor: pointer; color: var(--accent); }
+    label.veld { display: block; margin-bottom: 12px; }
+    input[type=text] { display: block; width: 100%; max-width: 360px; margin-top: 4px; padding: 7px 9px; border: 1px solid var(--rand); border-radius: 6px; background: var(--kaart); color: var(--tekst); font: inherit; }
+    button { font: inherit; border: 0; border-radius: 6px; padding: 9px 18px; background: var(--accent); color: var(--accent-tekst); cursor: pointer; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    button.klein { padding: 4px 10px; font-size: 13px; }
+    .url { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+    .url input { flex: 1; max-width: none; margin: 0; font: 13px/1.4 ui-monospace, Menlo, Consolas, monospace; }
+    .url span { min-width: 112px; color: var(--zacht); font-size: 14px; }
+    ol.stappen { margin: 10px 0 0; padding-left: 20px; color: var(--zacht); font-size: 14px; }
+    code { background: var(--code); padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+    @media (max-width: 560px) { .url { flex-wrap: wrap; } .url span { min-width: 100%; } }
+
+    header.kop { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
+    button.secundair { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+    dialog { width: min(780px, calc(100vw - 32px)); max-height: calc(100vh - 48px); padding: 0; overflow: auto;
+        border: 1px solid var(--rand); border-radius: 12px; background: var(--kaart); color: var(--tekst); }
+    dialog::backdrop { background: rgba(0, 0, 0, .45); }
+    .hulp-kop { position: sticky; top: 0; z-index: 1; display: flex; justify-content: space-between; align-items: center;
+        gap: 12px; padding: 14px 20px; background: var(--kaart); border-bottom: 1px solid var(--rand); }
+    .hulp-kop h2 { margin: 0; }
+    .hulp-nav { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 10px 20px 0; font-size: 14px; }
+    .hulp-inhoud { padding: 0 20px 24px; }
+    .hulp-inhoud h3 { margin: 22px 0 6px; font-size: 16px; scroll-margin-top: 64px; }
+    .hulp-inhoud ol, .hulp-inhoud ul { margin: 6px 0 8px; padding-left: 22px; }
+    .hulp-inhoud li { margin-bottom: 4px; }
+    .hulp-inhoud td:first-child { white-space: nowrap; }
+    .hulp-inhoud code { word-break: break-all; }
+    .pad { font-weight: 600; }
+</style>
+<script src="instellingen.js" onerror="window.EVA_INSTELLINGEN_ONLEESBAAR = true"></script>
+</head>
+<body>
+<main>
+    <header class="kop">
+        <div>
+            <h1>EVA dummy-API publiceren</h1>
+            <p class="sub">Zet een ingevulde EVA-dummy-Excel om naar de twee bestanden die Roosterplanning ophaalt, en zet ze online.</p>
+        </div>
+        <button type="button" class="secundair" id="hulpKnop">Hulp</button>
+    </header>
+
+    <section class="kaart" id="verbinding"><p class="zacht">Instellingen lezen…</p></section>
+
+    <section class="kaart">
+        <h2>1. Excel kiezen</h2>
+        <label class="dropzone" id="dropzone">
+            <strong>Sleep je Excel hierheen</strong>
+            <span class="zacht">of klik om een bestand te kiezen</span>
+            <input type="file" id="bestand" accept=".xlsx">
+        </label>
+        <p class="zacht" style="margin-top:8px">Excel aangepast? Sla op en sleep het bestand opnieuw hierheen.</p>
+        <div id="controle"></div>
+    </section>
+
+    <section class="kaart" id="publiceren" hidden>
+        <h2>2. Publiceren</h2>
+        <label class="veld">Je naam <span class="zacht">(komt in de publicatiegeschiedenis)</span>
+            <input type="text" id="naam" autocomplete="name">
+        </label>
+        <button type="button" id="knop">Publiceren</button>
+        <div id="resultaat"></div>
+    </section>
+
+    <section class="kaart" id="urls" hidden>
+        <h2>URL's voor Roosterplanning</h2>
+        <p class="zacht">Vul deze in bij EVA-instellingen. Ze blijven gelijk bij elke publicatie.</p>
+        <div id="urllijst"></div>
+        <p style="margin-top:12px"><a id="geschiedenis" target="_blank" rel="noopener">Publicatiegeschiedenis op GitHub</a></p>
+    </section>
+</main>
+
+<dialog id="hulp" aria-labelledby="hulpTitel">
+    <div class="hulp-kop">
+        <h2 id="hulpTitel">Hulp</h2>
+        <button type="button" class="secundair klein" id="hulpSluiten">Sluiten</button>
+    </div>
+    <nav class="hulp-nav">
+        <a href="#h-publiceren">Publiceren</a>
+        <a href="#h-instellen">Roosterplanning instellen</a>
+        <a href="#h-testen">Testen in Roosterplanning</a>
+        <a href="#h-problemen">Als het niet werkt</a>
+        <a href="#h-beheer">Beheer</a>
+    </nav>
+    <div class="hulp-inhoud">
+        <h3 id="h-publiceren">Publiceren</h3>
+        <p>Met deze pagina test je de LMS-koppeling (EVA) van Roosterplanning zonder echt LMS. Je zet scholingen en
+            inschrijvingen in Excel. De pagina controleert ze en zet ze als twee bestanden in de openbare GitHub-repo
+            <a data-repo-link target="_blank" rel="noopener"></a>, waar Roosterplanning ze ophaalt. Er staan alleen dummygegevens in.</p>
+        <ol>
+            <li>Maak in deze map een kopie van <code>EVA-dummy-import-voorbeeld.xlsx</code> en vul die in. Het tabblad
+                Toelichting legt de velden uit.</li>
+            <li>Sleep het opgeslagen bestand in deze pagina. Fouten verschijnen meteen: pas de Excel aan, sla op en sleep
+                hem opnieuw.</li>
+            <li>Vul je naam in en klik op <strong>Publiceren</strong>. Binnen 5 minuten staat de nieuwe versie online.</li>
+        </ol>
+        <p>Elke publicatie is de volledige stand: wat niet meer in de Excel staat, verwijdert Roosterplanning bij het
+            volgende ophalen. Diensten die al zijn aangemaakt, blijven staan.</p>
+        <p>Goed om te weten:</p>
+        <ul>
+            <li>Open deze pagina vanuit de map op je computer (Finder of Verkenner, met OneDrive gesynchroniseerd), niet
+                via Teams, de OneDrive-website of een mailbijlage. Dan opent de browser een losse kopie zonder
+                <code>instellingen.js</code>.</li>
+            <li>Gebruik een recente Chrome, Edge, Safari of Firefox.</li>
+            <li><code>instellingen.js</code> bevat een geheim token: niet doorsturen en niet in GitHub zetten.</li>
+            <li>De bestanden in GitHub hoef je nooit met de hand te bewerken; de volgende publicatie overschrijft ze.</li>
+        </ul>
+
+        <h3 id="h-instellen">Roosterplanning instellen (eenmalig per omgeving)</h3>
+        <p>Je hebt de rechten <em>EVA koppeling instellingen bewerken</em> en <em>EVA trainingen en kandidaten
+            bekijken</em> nodig, of superuser. Ga naar
+            <span class="pad">Beheer → Site instellen → EVA koppeling → Instellen</span> en vul in:</p>
+        <div class="tabel">
+            <table>
+                <thead><tr><th>Veld</th><th>Waarde</th></tr></thead>
+                <tbody>
+                <tr><td>Gegevens ophalen bij EVA ingeschakeld</td><td>Aan. Uit = Roosterplanning haalt niets op en maakt geen diensten.</td></tr>
+                <tr><td>EVA endpoint scholingen</td><td><code data-url="scholingen.json"></code></td></tr>
+                <tr><td>EVA endpoint inschrijvingen</td><td><code data-url="inschrijvingen.json"></code></td></tr>
+                <tr><td>Automatisch verwerken vanaf</td><td>Leeg: alleen inschrijvingen in de toekomst, in roosters die nog
+                    niet zijn gepubliceerd. Met een datum: inschrijvingen ná die datum, ook in gepubliceerde roosters,
+                    zolang de urenverantwoording niet is geaccordeerd.</td></tr>
+                <tr><td>Dienstcode voor scholing</td><td>Een dienstcode die in <em>elk</em> rooster van de testmedewerkers
+                    als dienst bestaat.</td></tr>
+                <tr><td>Gebruiker voor het automatisch<br>aanmaken/wijzigen van diensten</td><td>De gebruiker onder wiens
+                    naam de diensten automatisch worden gemaakt (knop Selecteren).</td></tr>
+                </tbody>
+            </table>
+        </div>
+        <p style="margin-top:8px">Klik op <strong>Opslaan</strong>. Roosterplanning test dan meteen of beide URL's
+            bereikbaar zijn. Lukt dat niet, dan verschijnt <em>"Er kan geen verbinding worden gemaakt met EVA, endpoint
+            en/of token is niet geldig."</em> De URL's kun je ook kopiëren onderaan de hoofdpagina.</p>
+
+        <h3 id="h-testen">Testen in Roosterplanning</h3>
+        <ol>
+            <li><strong>Gegevens ophalen.</strong> Roosterplanning haalt de bestanden op met het servercommando
+                <code>php artisan eva:sync --site=&lt;site&gt;</code>. Daar is geen knop voor: het draait volgens de
+                planning op de server, of iemand met servertoegang start het. Vraag bij beheer na of het op jouw
+                omgeving is ingepland en hoe vaak.</li>
+            <li><strong>Controleren.</strong> Ga naar <span class="pad">Beheer → Overzicht scholingen</span> en kies de
+                maand. Elke inschrijving staat erin met medewerker, datum, scholing, tijden en locatie. Ontbreekt er een,
+                kijk dan bij <a href="#h-problemen">Als het niet werkt</a>.</li>
+            <li><strong>Diensten maken.</strong> Per inschrijving: klik in de kolom <em>Actie</em> op de ronde pijlknop
+                (tooltip <em>Synchroniseer</em>). Die knop staat er zolang de dienst nog niet overeenkomt met de
+                inschrijving. Alles tegelijk: het servercommando <code>php artisan eva:mutate --site=&lt;site&gt;</code>,
+                net als het ophalen via de planning of door beheer.</li>
+            <li><strong>Resultaat.</strong> Rechts in het overzicht en in het rooster staat een dienst met de
+                scholingsdienstcode, de tijden uit de Excel en de titel van de scholing als opmerking. Twee scholingen op
+                één dag worden één dienst, van de vroegste begin- tot de laatste eindtijd.</li>
+        </ol>
+
+        <h3 id="h-problemen">Als het niet werkt</h3>
+        <div class="tabel">
+            <table>
+                <thead><tr><th>Wat je ziet</th><th>Oorzaak en oplossing</th></tr></thead>
+                <tbody>
+                <tr><td><em>De browser kan<br>instellingen.js niet lezen.</em></td><td>De pagina is als losse kopie geopend
+                    (via Teams, de OneDrive-website of Outlook), of <code>instellingen.js</code> staat niet onder precies
+                    die naam naast de pagina, of staat nog alleen online. De melding noemt de map waaruit de pagina is
+                    geopend.</td></tr>
+                <tr><td>Inschrijving ontbreekt in<br>Overzicht scholingen</td><td>Het personeelsnummer bestaat niet in
+                    Roosterplanning (gebruik het nummer zonder <code>/volgnummer</code>). Of <code>eva:sync</code> heeft
+                    nog niet gedraaid sinds het publiceren, of de publicatie is jonger dan 5 minuten.</td></tr>
+                <tr><td>Pijlknop grijs:<br><em>Geen roosterregel.</em></td><td>De medewerker heeft op die dag geen
+                    actief dienstverband in Roosterplanning.</td></tr>
+                <tr><td>Pijlknop grijs:<br><em>In stempelfase.</em></td><td>Het basisrooster is voor die dag nog niet
+                    uitgerold. Kies een datum binnen de uitgerolde periode.</td></tr>
+                <tr><td>Pijlknop grijs:<br><em>Rooster niet in bewerking.</em></td><td>Het rooster is op die dag al
+                    gepubliceerd. Kies een latere datum, of vul <em>Automatisch verwerken vanaf</em> in.</td></tr>
+                <tr><td>Pijlknop grijs:<br><em>Urenverantwoording reeds<br>geaccordeerd.</em></td><td>Kies een datum na
+                    de laatste accordering.</td></tr>
+                <tr><td><code>ROSTER_HAS_NO_TRAINING_SHIFT</code></td><td>Het rooster van de medewerker heeft geen
+                    dienst met de ingestelde scholingsdienstcode.</td></tr>
+                <tr><td><code>RESOURCE_HAS_LEAVE</code></td><td>De medewerker heeft die dag verlof. Kies een andere dag.</td></tr>
+                <tr><td><code>RESOURCE_HAS_NO_ROSTER</code>,<br><code>NO_RESOURCE</code></td><td>Geen actief
+                    dienstverband of geen rooster op die dag.</td></tr>
+                <tr><td><code>ENROLMENT_BEFORE_CUT_OFF_DATE</code></td><td>De inschrijving ligt vóór <em>Automatisch
+                    verwerken vanaf</em>. Gebruik de pijlknop, die controleert deze datum niet.</td></tr>
+                <tr><td>Foutlog</td><td><span class="pad">Beheer → Site instellen → EVA koppeling → Foutlog</span>
+                    toont alleen fouten bij het ophalen, zoals geen toegang. Fouten bij het maken van diensten staan
+                    daar niet in.</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <h3 id="h-beheer">Beheer: het token vervangen</h3>
+        <p>Het token verloopt; zie de vervaldatum in GitHub. De pagina meldt dan <em>"het token is ongeldig of
+            verlopen"</em>. Maak als het C-quential-account op GitHub een nieuw token:</p>
+        <ol>
+            <li>Profielfoto → <strong>Settings</strong> → <strong>Developer settings</strong> → <strong>Personal access
+                tokens</strong> → <strong>Fine-grained tokens</strong> → <strong>Generate new token</strong>.</li>
+            <li>Resource owner <strong>C-quential</strong>, Repository access <strong>Only select repositories</strong>
+                → <code data-repo-naam></code>.</li>
+            <li>Repository permissions: <strong>Contents: Read and write</strong>, verder niets.</li>
+            <li>Open <code>instellingen.js</code> in deze map met TextEdit (Mac) of Kladblok (Windows) en plak het token
+                tussen de aanhalingstekens bij <code>token</code>. Typ de aanhalingstekens niet opnieuw.</li>
+        </ol>
+    </div>
+</dialog>
+
+<script>
+'use strict';
+
+// ---------------------------------------------------------------------------------------------- VASTE INSTELLINGEN
+const CFG = Object.assign({repo: '', branch: 'main', token: '', apiUrl: '', rawUrl: ''}, window.EVA_INSTELLINGEN || {});
+const API = (CFG.apiUrl || 'https://api.github.com').replace(/\/+$/, '');
+const RAW = (CFG.rawUrl || 'https://raw.githubusercontent.com').replace(/\/+$/, '');
+const BESTAND_SCHOLINGEN = 'scholingen.json';
+const BESTAND_INSCHRIJVINGEN = 'inschrijvingen.json';
+const KOLOMMEN_SCHOLINGEN = ['ID', 'TITLE', 'LOCATION'];
+const KOLOMMEN_INSCHRIJVINGEN = ['PERSONEELSNUMMER', 'C_ID', 'BEGINTIJD', 'EINDTIJD'];
+const MAX_TEKST = 255; // varchar(255) in evaTrainings
+const POGINGEN = 3;
+const NS_REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+
+class Fout extends Error {}
+class GithubFout extends Fout {
+    constructor(tekst, status) { super(tekst); this.status = status; }
+}
+
+let klaar = null; // {bestanden: {pad: inhoud}, samenvatting, excel} van een goedgekeurde Excel
+let verbonden = false;
+
+const $ = id => document.getElementById(id);
+
+// ------------------------------------------------------------------------------------------------------- HOOFDLIJN
+async function start() {
+    try { $('naam').value = localStorage.getItem('evaNaam') || ''; } catch (e) { /* geen opslag: niet erg */ }
+
+    const dropzone = $('dropzone');
+    $('bestand').addEventListener('change', e => { if (e.target.files[0]) verwerk(e.target.files[0]); e.target.value = ''; });
+    ['dragenter', 'dragover'].forEach(t => dropzone.addEventListener(t, e => { e.preventDefault(); dropzone.classList.add('actief'); }));
+    ['dragleave', 'drop'].forEach(t => dropzone.addEventListener(t, () => dropzone.classList.remove('actief')));
+    dropzone.addEventListener('drop', e => { e.preventDefault(); if (e.dataTransfer.files[0]) verwerk(e.dataTransfer.files[0]); });
+    // Een bestand dat naast de dropzone valt, niet door de browser laten openen.
+    ['dragover', 'drop'].forEach(t => window.addEventListener(t, e => e.preventDefault()));
+    $('knop').addEventListener('click', publiceer);
+
+    const hulp = $('hulp');
+    $('hulpKnop').addEventListener('click', () => hulp.showModal());
+    $('hulpSluiten').addEventListener('click', () => hulp.close());
+    hulp.addEventListener('click', e => { if (e.target === hulp) hulp.close(); }); // klik naast het venster
+    hulp.querySelectorAll('a[href^="#"]').forEach(a => a.addEventListener('click', e => {
+        e.preventDefault();
+        hulp.querySelector(a.getAttribute('href')).scrollIntoView({behavior: 'smooth', block: 'start'});
+    }));
+    vulHulp();
+
+    await controleerVerbinding();
+}
+
+async function controleerVerbinding() {
+    const vak = $('verbinding');
+    if (window.EVA_INSTELLINGEN_ONLEESBAAR) {
+        return toon(vak, melding('fout', 'De browser kan instellingen.js niet lezen.', redenenOnleesbaar()));
+    }
+    if (!window.EVA_INSTELLINGEN) {
+        return toon(vak, melding('fout', 'instellingen.js is gevonden, maar bevat een fout.',
+            ['Meestal is bij het plakken van het token een aanhalingsteken weggevallen of een krul geworden (‘ ’ in plaats van \'). Zie Hulp > Beheer, rechtsboven.']));
+    }
+    if (!/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/.test(CFG.repo) || !CFG.token || !CFG.branch) {
+        return toon(vak, melding('fout', 'instellingen.js is nog niet ingevuld.',
+            ['Vul repo (eigenaar/naam), branch en token in. Zie Hulp > Beheer, rechtsboven.']));
+    }
+
+    toonUrls();
+    try {
+        const repo = await github('GET', `/repos/${CFG.repo}`);
+        if (repo.private) {
+            return toon(vak, melding('fout', `De repo ${CFG.repo} is privé.`,
+                ['Roosterplanning kan de bestanden dan niet lezen. Maak de repo openbaar (Settings > Danger Zone).']));
+        }
+        verbonden = true;
+        toon(vak, melding('ok', `Verbonden met GitHub-repo ${CFG.repo} (openbaar), branch ${CFG.branch}.`));
+        werkKnopBij();
+    } catch (e) {
+        toon(vak, melding('fout', 'Geen verbinding met GitHub.', [e.message]));
+    }
+}
+
+async function verwerk(bestand) {
+    klaar = null;
+    werkKnopBij();
+    $('resultaat').replaceChildren();
+    const vak = $('controle');
+    toon(vak, melding('info', `${bestand.name} lezen…`));
+    try {
+        if (!/\.xlsx$/i.test(bestand.name)) {
+            throw new Fout('Kies een Excel-werkmap (.xlsx).');
+        }
+        const tabbladen = await leesXlsx(await bestand.arrayBuffer());
+        const fouten = [];
+        const waarschuwingen = [];
+        const {scholingen, titels} = controleerScholingen(tabel(tabbladen, 'Scholingen', KOLOMMEN_SCHOLINGEN), fouten);
+        const inschrijvingen = controleerInschrijvingen(tabel(tabbladen, 'Inschrijvingen', KOLOMMEN_INSCHRIJVINGEN), titels, fouten, waarschuwingen);
+        const gebruikt = new Set(inschrijvingen.map(i => i.C_ID));
+        for (const [id, titel] of titels) {
+            if (!gebruikt.has(id)) {
+                waarschuwingen.push(['Scholingen', `scholing ${id} (${titel}) heeft geen inschrijvingen.`]);
+            }
+        }
+        if (!fouten.length && !scholingen.length) {
+            fouten.push(['Scholingen', 'het tabblad is leeg. Roosterplanning zou dan alle scholingen verwijderen.']);
+        }
+
+        const periode = bepaalPeriode(inschrijvingen);
+        const samenvatting = `${scholingen.length} scholingen, ${inschrijvingen.length} inschrijvingen${periode ? ` (${periode})` : ''}`;
+        const delen = [];
+        if (fouten.length) {
+            delen.push(melding('fout', `${bestand.name}: niet te publiceren, ${fouten.length} fout(en).`,
+                ['Pas de Excel aan, sla op en sleep hem opnieuw hierheen. De vorige versie blijft online.']));
+            delen.push(meldingTabel(fouten));
+        } else {
+            delen.push(melding('ok', `${bestand.name}: in orde. ${samenvatting}.`));
+            klaar = {
+                bestanden: {[BESTAND_SCHOLINGEN]: jsonTekst(scholingen), [BESTAND_INSCHRIJVINGEN]: jsonTekst(inschrijvingen)},
+                samenvatting,
+                excel: bestand.name,
+            };
+        }
+        if (waarschuwingen.length) {
+            delen.push(melding('let', `Let op (${waarschuwingen.length}):`, waarschuwingen.map(([waar, tekst]) => `${waar}: ${tekst}`)));
+        }
+        if (!fouten.length) {
+            delen.push(voorbeeld(scholingen, inschrijvingen));
+        }
+        toon(vak, ...delen);
+        $('publiceren').hidden = false;
+        werkKnopBij();
+    } catch (e) {
+        toon(vak, melding('fout', `${bestand.name}: kan niet worden gelezen.`, [e instanceof Fout ? e.message : `Onverwachte fout: ${e.message}`]));
+    }
+}
+
+async function publiceer() {
+    if (!klaar || !verbonden) {
+        return;
+    }
+    const naam = $('naam').value.trim();
+    try { localStorage.setItem('evaNaam', naam); } catch (e) { /* geen opslag: niet erg */ }
+    const vak = $('resultaat');
+    const stappen = document.createElement('ol');
+    stappen.className = 'stappen';
+    const stap = tekst => stappen.append(Object.assign(document.createElement('li'), {textContent: tekst}));
+    toon(vak, stappen);
+    $('knop').disabled = true;
+
+    const {bestanden, samenvatting, excel} = klaar;
+    try {
+        const commit = await publiceerOpGithub(bestanden, `EVA-dummy publiceren: ${samenvatting}\n\nExcel: ${excel}\nDoor: ${naam || 'onbekend'}`, stap);
+        if (commit === null) {
+            toon(vak, melding('ok', 'Ongewijzigd: precies deze gegevens staan al online.'));
+            return;
+        }
+        stap('Controleren of Roosterplanning de bestanden kan lezen…');
+        await controleerOpenbaar(commit, bestanden);
+        const link = Object.assign(document.createElement('a'), {
+            href: `https://github.com/${CFG.repo}/commit/${commit}`, target: '_blank', rel: 'noopener', textContent: commit.slice(0, 7),
+        });
+        const kop = document.createElement('p');
+        kop.append(`Gepubliceerd: ${samenvatting}. Commit `, link, '.');
+        const blok = melding('ok', '', [
+            'GitHub kan nog tot 5 minuten de vorige versie tonen.',
+            'Roosterplanning neemt de nieuwe versie over bij de volgende eva:sync.',
+            'Personeelsnummers die niet in Roosterplanning bestaan, worden daar zonder melding overgeslagen.',
+        ]);
+        blok.firstChild.replaceWith(kop);
+        toon(vak, blok);
+    } catch (e) {
+        toon(vak, stappen, melding('fout', 'Publiceren mislukt.', [e instanceof Fout ? e.message : `Onverwachte fout: ${e.message}`]));
+    } finally {
+        werkKnopBij();
+    }
+}
+
+function werkKnopBij() {
+    $('knop').disabled = !(klaar && verbonden);
+}
+
+// ----------------------------------------------------------------------------------------------------- CONTROLES
+function controleerScholingen(rijen, fouten) {
+    const scholingen = [];
+    const titels = new Map();
+    for (const [nr, rij] of rijen) {
+        const waar = `Scholingen rij ${nr}`;
+        const id = geheelGetal(rij.ID);
+        const titel = tekst(rij.TITLE);
+        const locatie = tekst(rij.LOCATION);
+        const rijFouten = [];
+        if (id === null) {
+            rijFouten.push('ID moet een positief geheel getal zijn');
+        } else if (titels.has(id)) {
+            rijFouten.push(`ID ${id} komt dubbel voor`);
+        }
+        if (titel === '') {
+            rijFouten.push('TITLE is leeg');
+        }
+        if (locatie === '') {
+            rijFouten.push('LOCATION is leeg (gebruik bijv. Online)');
+        }
+        for (const [kolom, waarde] of [['TITLE', titel], ['LOCATION', locatie]]) {
+            if ([...waarde].length > MAX_TEKST) {
+                rijFouten.push(`${kolom} is langer dan ${MAX_TEKST} tekens`);
+            }
+        }
+        if (rijFouten.length) {
+            rijFouten.forEach(f => fouten.push([waar, `${f}.`]));
+            continue;
+        }
+        titels.set(id, titel);
+        scholingen.push({ID: id, TITLE: titel, LOCATION: locatie});
+    }
+    scholingen.sort((a, b) => a.ID - b.ID);
+
+    return {scholingen, titels};
+}
+
+function controleerInschrijvingen(rijen, titels, fouten, waarschuwingen) {
+    const inschrijvingen = [];
+    const gezien = new Map();
+    const vandaag = datumTekst(new Date());
+    for (const [nr, rij] of rijen) {
+        const waar = `Inschrijvingen rij ${nr}`;
+        const rijFouten = [];
+
+        const pnr = tekst(rij.PERSONEELSNUMMER);
+        if (pnr === '') {
+            rijFouten.push('PERSONEELSNUMMER is leeg');
+        } else if (/[/;]/.test(pnr)) {
+            rijFouten.push(`PERSONEELSNUMMER '${pnr}' bevat een dienstverbandvolgnummer; gebruik alleen het deel vóór '/' of ';'`);
+        } else if (!/^[A-Za-z0-9]+$/.test(pnr)) {
+            rijFouten.push(`PERSONEELSNUMMER '${pnr}' mag alleen letters en cijfers bevatten`);
+        }
+
+        const cid = geheelGetal(rij.C_ID);
+        if (cid === null) {
+            rijFouten.push('C_ID moet een positief geheel getal zijn');
+        } else if (!titels.has(cid)) {
+            rijFouten.push(`C_ID ${cid} bestaat niet in Scholingen (of die scholing heeft zelf een fout)`);
+        }
+
+        const begin = tijdstip(rij.BEGINTIJD);
+        const eind = tijdstip(rij.EINDTIJD);
+        if (begin === null) {
+            rijFouten.push('BEGINTIJD is geen geldige datum + tijd');
+        }
+        if (eind === null) {
+            rijFouten.push('EINDTIJD is geen geldige datum + tijd');
+        }
+        if (begin !== null && eind !== null) {
+            if (eind <= begin) {
+                rijFouten.push('EINDTIJD ligt niet na BEGINTIJD');
+            } else if (eind.slice(0, 10) !== begin.slice(0, 10)) {
+                rijFouten.push('EINDTIJD valt op een andere dag; maak één regel per dag');
+            }
+        }
+
+        if (!rijFouten.length) {
+            const sleutel = `${pnr}|${cid}|${begin}`; // unieke sleutel in evaEnrolments
+            if (gezien.has(sleutel)) {
+                rijFouten.push(`dubbele inschrijving (zelfde als rij ${gezien.get(sleutel)})`);
+            } else {
+                gezien.set(sleutel, nr);
+            }
+        }
+
+        if (rijFouten.length) {
+            rijFouten.forEach(f => fouten.push([waar, `${f}.`]));
+            continue;
+        }
+        if (begin.slice(0, 10) < vandaag) {
+            waarschuwingen.push([waar, 'ligt in het verleden; Roosterplanning maakt er geen dienst van.']);
+        }
+        inschrijvingen.push({PERSONEELSNUMMER: pnr, C_ID: cid, BEGINTIJD: begin, EINDTIJD: eind});
+    }
+    inschrijvingen.sort((a, b) => a.BEGINTIJD.localeCompare(b.BEGINTIJD) || a.PERSONEELSNUMMER.localeCompare(b.PERSONEELSNUMMER));
+
+    return inschrijvingen;
+}
+
+function tekst(waarde) {
+    if (waarde === null || waarde === undefined) {
+        return '';
+    }
+
+    return String(waarde).trim(); // een getal (cel niet als tekst opgemaakt) wordt '100234'
+}
+
+function geheelGetal(waarde) {
+    if (typeof waarde === 'number') {
+        return Number.isSafeInteger(waarde) && waarde >= 1 ? waarde : null;
+    }
+    const m = typeof waarde === 'string' ? /^\s*([1-9][0-9]{0,14})\s*$/.exec(waarde) : null;
+
+    return m ? Number(m[1]) : null;
+}
+
+/** Datum + tijd uit een Excel-serienummer of uit tekst; als 'jjjj-mm-dd uu:mm:ss' (Nederlandse tijd, zonder zone). */
+function tijdstip(waarde) {
+    if (typeof waarde === 'number') {
+        if (waarde < 1 || Number.isInteger(waarde)) {
+            return null; // alleen een tijd of alleen een datum
+        }
+        // 25569 = 1970-01-01 in het 1900-systeem van Excel; rekenen in UTC, dus zonder zomertijd-verschuiving.
+        return tijdTekst(new Date(Math.round((waarde - 25569) * 86400) * 1000));
+    }
+    if (typeof waarde !== 'string') {
+        return null;
+    }
+    const s = waarde.trim();
+    let m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(s);
+    let delen = m ? [m[1], m[2], m[3], m[4], m[5], m[6]] : null;
+    if (!delen && (m = /^(\d{1,2})-(\d{1,2})-(\d{4}) (\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(s))) {
+        delen = [m[3], m[2], m[1], m[4], m[5], m[6]];
+    }
+    if (!delen) {
+        return null;
+    }
+    const [j, mnd, d, u, min, sec] = delen.map(x => Number(x || 0));
+    const dt = new Date(Date.UTC(j, mnd - 1, d, u, min, sec));
+    const geldig = dt.getUTCFullYear() === j && dt.getUTCMonth() === mnd - 1 && dt.getUTCDate() === d
+        && dt.getUTCHours() === u && dt.getUTCMinutes() === min && dt.getUTCSeconds() === sec;
+
+    return geldig ? tijdTekst(dt) : null;
+}
+
+const twee = n => String(n).padStart(2, '0');
+const tijdTekst = dt => `${dt.getUTCFullYear()}-${twee(dt.getUTCMonth() + 1)}-${twee(dt.getUTCDate())} ${twee(dt.getUTCHours())}:${twee(dt.getUTCMinutes())}:${twee(dt.getUTCSeconds())}`;
+const datumTekst = dt => `${dt.getFullYear()}-${twee(dt.getMonth() + 1)}-${twee(dt.getDate())}`;
+const jsonTekst = data => JSON.stringify(data, null, 4) + '\n';
+
+function bepaalPeriode(inschrijvingen) {
+    if (!inschrijvingen.length) {
+        return '';
+    }
+    const dagen = inschrijvingen.map(i => i.BEGINTIJD.slice(0, 10)).sort();
+
+    return `${dagen[0]} t/m ${dagen[dagen.length - 1]}`;
+}
+
+// ------------------------------------------------------------------------------------------------------ GITHUB
+async function publiceerOpGithub(bestanden, bericht, stap) {
+    const repo = `/repos/${CFG.repo}`;
+    for (let poging = 1; ; poging++) {
+        stap(poging === 1 ? 'Huidige versie op GitHub ophalen…' : 'Iemand anders publiceerde tegelijk; opnieuw vanaf de nieuwste versie…');
+        const huidig = (await github('GET', `${repo}/git/ref/heads/${CFG.branch}`)).object.sha;
+        const boom = (await github('GET', `${repo}/git/commits/${huidig}`)).tree.sha;
+
+        const gewijzigd = [];
+        for (const [pad, inhoud] of Object.entries(bestanden)) {
+            if (await inhoudOpGithub(`${repo}/contents/${pad}?ref=${huidig}`) !== inhoud) {
+                gewijzigd.push({path: pad, mode: '100644', type: 'blob', content: inhoud});
+            }
+        }
+        if (!gewijzigd.length) {
+            return null;
+        }
+
+        stap(`Nieuwe versie maken (${gewijzigd.map(g => g.path).join(', ')})…`);
+        const nieuweBoom = (await github('POST', `${repo}/git/trees`, {base_tree: boom, tree: gewijzigd})).sha;
+        const commit = (await github('POST', `${repo}/git/commits`, {message: bericht, tree: nieuweBoom, parents: [huidig]})).sha;
+        try {
+            await github('PATCH', `${repo}/git/refs/heads/${CFG.branch}`, {sha: commit, force: false});
+
+            return commit;
+        } catch (e) {
+            if (!(e instanceof GithubFout) || e.status !== 422 || poging >= POGINGEN) {
+                throw e;
+            }
+        }
+    }
+}
+
+async function inhoudOpGithub(pad) {
+    try {
+        const bestand = await github('GET', pad);
+        const bytes = Uint8Array.from(atob(bestand.content.replace(/\s/g, '')), c => c.charCodeAt(0));
+
+        return new TextDecoder().decode(bytes);
+    } catch (e) {
+        if (e instanceof GithubFout && e.status === 404) {
+            return null; // bestaat nog niet
+        }
+        throw e;
+    }
+}
+
+async function controleerOpenbaar(commit, bestanden) {
+    for (const [pad, inhoud] of Object.entries(bestanden)) {
+        for (let poging = 1; ; poging++) {
+            const antwoord = await fetch(`${RAW}/${CFG.repo}/${commit}/${pad}`, {cache: 'no-store'}).catch(() => null);
+            if (antwoord && antwoord.ok && await antwoord.text() === inhoud) {
+                break;
+            }
+            if (poging >= POGINGEN) {
+                throw new Fout(`Gepubliceerd (commit ${commit.slice(0, 7)}), maar ${pad} is niet openbaar te lezen`
+                    + ` (HTTP ${antwoord ? antwoord.status : 'geen verbinding'}). Is de repo openbaar?`);
+            }
+            await new Promise(r => setTimeout(r, 2000));
+        }
+    }
+}
+
+async function github(methode, pad, body = null) {
+    const headers = {
+        'Authorization': `Bearer ${CFG.token}`,
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+    };
+    if (body) {
+        headers['Content-Type'] = 'application/json';
+    }
+    let antwoord;
+    try {
+        antwoord = await fetch(API + pad, {method: methode, headers, body: body ? JSON.stringify(body) : undefined, cache: 'no-store'});
+    } catch (e) {
+        throw new Fout('Geen verbinding met GitHub. Controleer je internetverbinding.');
+    }
+    const inhoud = await antwoord.text();
+    let data = {};
+    try { data = inhoud ? JSON.parse(inhoud) : {}; } catch (e) { /* geen JSON */ }
+    if (antwoord.ok) {
+        return data;
+    }
+    const uitleg = {
+        401: 'het token is ongeldig of verlopen (token in instellingen.js)',
+        403: 'het token heeft geen toegang (nodig: alleen deze repo, Contents: Read and write)',
+        404: 'repo of branch niet gevonden, of het token heeft geen toegang tot deze repo',
+        409: 'de repo is leeg; maak hem opnieuw aan met "Add a README file"',
+        422: 'GitHub weigerde de wijziging',
+    }[antwoord.status] || 'onverwacht antwoord van GitHub';
+
+    throw new GithubFout(`GitHub gaf HTTP ${antwoord.status}${data.message ? ` (${data.message})` : ''}: ${uitleg}.`, antwoord.status);
+}
+
+// --------------------------------------------------------------------------------------------------- EXCEL LEZEN
+/** Rijen van een tabblad als [rijnummer, {kolomnaam: waarde}], kolommen op naam uit rij 1. Lege rijen vallen weg. */
+function tabel(tabbladen, naam, kolommen) {
+    const cellen = tabbladen[naam];
+    if (!cellen) {
+        throw new Fout(`Tabblad '${naam}' ontbreekt. Gebruik EVA-dummy-import-voorbeeld.xlsx als basis.`);
+    }
+    const kop = new Map();
+    for (const [kolom, waarde] of cellen.get(1) || []) {
+        kop.set(tekst(waarde), kolom);
+    }
+    const ontbreekt = kolommen.filter(k => !kop.has(k));
+    if (ontbreekt.length) {
+        throw new Fout(`Tabblad '${naam}' mist kolom(men): ${ontbreekt.join(', ')}. Gebruik EVA-dummy-import-voorbeeld.xlsx als basis.`);
+    }
+    const rijen = [];
+    for (const [nr, rij] of [...cellen].sort((a, b) => a[0] - b[0])) {
+        if (nr === 1) {
+            continue;
+        }
+        const waarden = {};
+        let gevuld = false;
+        for (const k of kolommen) {
+            let w = rij.get(kop.get(k));
+            if (w === undefined || (typeof w === 'string' && w.trim() === '')) {
+                w = null;
+            }
+            waarden[k] = w;
+            gevuld = gevuld || w !== null;
+        }
+        if (gevuld) {
+            rijen.push([nr, waarden]);
+        }
+    }
+
+    return rijen;
+}
+
+/**
+ * Minimale .xlsx-lezer (zip + XML) zonder externe bibliotheek. Per tabblad: Map rijnummer => Map kolomindex => waarde.
+ * Waarden: string, number (getal of datum als Excel-serienummer), boolean of null. Formules: de opgeslagen uitkomst.
+ */
+async function leesXlsx(buffer) {
+    if (typeof DecompressionStream === 'undefined') {
+        throw new Fout('Deze browser is te oud. Gebruik een recente Chrome, Edge, Safari of Firefox.');
+    }
+    const zip = openZip(buffer);
+    const xml = async naam => {
+        const inhoud = naam ? await zip.lees(naam) : null;
+        const doc = inhoud === null ? null : new DOMParser().parseFromString(inhoud, 'application/xml');
+        if (!doc || doc.getElementsByTagName('parsererror').length) {
+            throw new Fout(`Onderdeel '${naam}' ontbreekt of is onleesbaar. Is dit een Excel-werkmap (.xlsx)?`);
+        }
+
+        return doc;
+    };
+
+    const werkmap = await xml('xl/workbook.xml');
+    const wbPr = elementen(werkmap, 'workbookPr')[0];
+    if (wbPr && ['1', 'true'].includes(wbPr.getAttribute('date1904'))) {
+        throw new Fout('De Excel gebruikt het 1904-datumsysteem; zet dat uit in de Excel-opties.');
+    }
+    const doelen = {};
+    for (const rel of elementen(await xml('xl/_rels/workbook.xml.rels'), 'Relationship')) {
+        const doel = rel.getAttribute('Target');
+        doelen[rel.getAttribute('Id')] = doel.startsWith('/') ? doel.slice(1) : `xl/${doel}`;
+    }
+    const gedeeld = [];
+    if (zip.heeft('xl/sharedStrings.xml')) {
+        for (const si of elementen(await xml('xl/sharedStrings.xml'), 'si')) {
+            gedeeld.push(celtekst(si));
+        }
+    }
+
+    const tabbladen = {};
+    for (const blad of elementen(werkmap, 'sheet')) {
+        const naam = blad.getAttribute('name');
+        if (naam === 'Scholingen' || naam === 'Inschrijvingen') {
+            const rid = blad.getAttributeNS(NS_REL, 'id') || blad.getAttribute('r:id');
+            tabbladen[naam] = leesTabblad(await xml(doelen[rid]), gedeeld);
+        }
+    }
+
+    return tabbladen;
+}
+
+function leesTabblad(doc, gedeeld) {
+    const rijen = new Map();
+    let rijNr = 0;
+    for (const row of elementen(doc, 'row')) {
+        rijNr = row.hasAttribute('r') ? parseInt(row.getAttribute('r'), 10) : rijNr + 1;
+        const cellen = new Map();
+        let kolom = 0;
+        for (const c of kinderen(row, 'c')) {
+            kolom = c.hasAttribute('r') ? kolomIndex(c.getAttribute('r')) : kolom + 1;
+            const v = kinderen(c, 'v')[0];
+            const t = v ? v.textContent : null;
+            let waarde;
+            switch (c.getAttribute('t') || 'n') {
+                case 's': waarde = t === null ? null : (gedeeld[parseInt(t, 10)] ?? null); break;
+                case 'inlineStr': waarde = kinderen(c, 'is').length ? celtekst(kinderen(c, 'is')[0]) : null; break;
+                case 'b': waarde = t === '1'; break;
+                case 'str': case 'e': case 'd': waarde = t; break;
+                default: waarde = t === null || t === '' ? null : Number(t);
+            }
+            cellen.set(kolom, waarde);
+        }
+        rijen.set(rijNr, cellen);
+    }
+
+    return rijen;
+}
+
+function celtekst(element) {
+    let s = '';
+    for (const t of elementen(element, 't')) {
+        let p = t.parentNode;
+        while (p && p !== element && p.localName !== 'rPh') {
+            p = p.parentNode;
+        }
+        if (!p || p === element) {
+            s += t.textContent; // fonetische tekst (rPh) overslaan
+        }
+    }
+
+    return s;
+}
+
+const elementen = (node, naam) => Array.from(node.getElementsByTagNameNS('*', naam));
+const kinderen = (node, naam) => Array.from(node.children).filter(n => n.localName === naam);
+const kolomIndex = cel => [...cel.replace(/[^A-Z]/gi, '').toUpperCase()].reduce((i, l) => i * 26 + l.charCodeAt(0) - 64, 0);
+
+/** Leest de centrale map van een zip; lees() pakt één bestand uit (opgeslagen of deflate). */
+function openZip(buffer) {
+    const data = new DataView(buffer);
+    const bytes = new Uint8Array(buffer);
+    const ongeldig = () => new Fout('Dit is geen geldige Excel-werkmap (.xlsx).');
+    let eind = -1;
+    for (let i = buffer.byteLength - 22; i >= Math.max(0, buffer.byteLength - 22 - 65535); i--) {
+        if (data.getUint32(i, true) === 0x06054b50) {
+            eind = i;
+            break;
+        }
+    }
+    if (eind < 0) {
+        throw ongeldig();
+    }
+    const items = new Map();
+    let p = data.getUint32(eind + 16, true);
+    for (let n = data.getUint16(eind + 10, true); n > 0; n--) {
+        if (p + 46 > buffer.byteLength || data.getUint32(p, true) !== 0x02014b50) {
+            throw ongeldig();
+        }
+        const lengte = data.getUint16(p + 28, true);
+        items.set(new TextDecoder().decode(bytes.subarray(p + 46, p + 46 + lengte)), {
+            methode: data.getUint16(p + 10, true),
+            grootte: data.getUint32(p + 20, true),
+            lokaal: data.getUint32(p + 42, true),
+        });
+        p += 46 + lengte + data.getUint16(p + 30, true) + data.getUint16(p + 32, true);
+    }
+
+    return {
+        heeft: naam => items.has(naam),
+        async lees(naam) {
+            const item = items.get(naam);
+            if (!item) {
+                return null;
+            }
+            const start = item.lokaal + 30 + data.getUint16(item.lokaal + 26, true) + data.getUint16(item.lokaal + 28, true);
+            const ruw = bytes.subarray(start, start + item.grootte);
+            if (item.methode === 0) {
+                return new TextDecoder().decode(ruw);
+            }
+            if (item.methode !== 8) {
+                throw ongeldig();
+            }
+            const stroom = new Blob([ruw]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+
+            return new TextDecoder().decode(await new Response(stroom).arrayBuffer());
+        },
+    };
+}
+
+// Waarom instellingen.js niet te lezen is. De map erbij noemen helpt: de oorzaak is bijna altijd waar de pagina geopend is.
+function redenenOnleesbaar() {
+    const pad = decodeURIComponent(location.pathname).replace(/^\/([A-Za-z]:)/, '$1');
+    const regels = [`Deze pagina is geopend vanuit: ${pad.slice(0, pad.lastIndexOf('/') + 1)}`];
+    if (/\/(Downloads|Temp|INetCache|Content\.Outlook)\//i.test(pad) || / \(\d+\)\.html?$/i.test(pad)) {
+        regels.push('Dat is een losse kopie (geopend via Teams, de OneDrive-website, Outlook of de browser). Open Publiceer.html vanuit de gesynchroniseerde OneDrive-map in Verkenner (Windows) of Finder (Mac).');
+    } else {
+        regels.push('Staat instellingen.js in deze map, onder precies die naam? Zet in Verkenner de bestandsnaamextensies aan: instellingen.js.txt of een conflictkopie als instellingen-PCNAAM.js werkt niet.');
+        regels.push('Staat er een wolkje bij instellingen.js? Klik er met rechts op, laat OneDrive het altijd op dit apparaat bewaren en laad de pagina opnieuw.');
+    }
+
+    return regels;
+}
+
+// ------------------------------------------------------------------------------------------------------- WEERGAVE
+function toon(vak, ...delen) {
+    vak.replaceChildren(...delen);
+}
+
+function melding(soort, kop, regels = []) {
+    const div = Object.assign(document.createElement('div'), {className: `melding ${soort}`});
+    div.append(Object.assign(document.createElement('p'), {textContent: kop}));
+    if (regels.length) {
+        const ul = document.createElement('ul');
+        regels.forEach(r => ul.append(Object.assign(document.createElement('li'), {textContent: r})));
+        div.append(ul);
+    }
+
+    return div;
+}
+
+function meldingTabel(fouten) {
+    return tabelElement(['Waar', 'Fout'], fouten);
+}
+
+function voorbeeld(scholingen, inschrijvingen) {
+    const details = document.createElement('details');
+    details.append(
+        Object.assign(document.createElement('summary'), {textContent: 'Bekijk wat er online komt'}),
+        Object.assign(document.createElement('p'), {textContent: BESTAND_SCHOLINGEN, className: 'zacht'}),
+        tabelElement(KOLOMMEN_SCHOLINGEN, scholingen.map(s => KOLOMMEN_SCHOLINGEN.map(k => s[k]))),
+        Object.assign(document.createElement('p'), {textContent: BESTAND_INSCHRIJVINGEN, className: 'zacht', style: 'margin-top:12px'}),
+        tabelElement(KOLOMMEN_INSCHRIJVINGEN, inschrijvingen.map(i => KOLOMMEN_INSCHRIJVINGEN.map(k => i[k]))),
+    );
+
+    return details;
+}
+
+function tabelElement(koppen, rijen) {
+    const wrap = Object.assign(document.createElement('div'), {className: 'tabel'});
+    const t = document.createElement('table');
+    const kop = t.createTHead().insertRow();
+    koppen.forEach(k => kop.append(Object.assign(document.createElement('th'), {textContent: k})));
+    const body = t.createTBody();
+    rijen.forEach(r => {
+        const tr = body.insertRow();
+        r.forEach(w => { tr.insertCell().textContent = String(w); });
+    });
+    wrap.append(t);
+
+    return wrap;
+}
+
+const rawUrl = pad => `${RAW}/${CFG.repo}/${CFG.branch}/${pad}`;
+
+/** Vult de URL's en de repo-naam in de hulp in. */
+function vulHulp() {
+    const ingesteld = /^[^/]+\/[^/]+$/.test(CFG.repo);
+    document.querySelectorAll('[data-url]').forEach(el => {
+        el.textContent = ingesteld ? rawUrl(el.dataset.url) : '(repo nog niet ingesteld in instellingen.js)';
+    });
+    document.querySelectorAll('[data-repo-naam]').forEach(el => { el.textContent = ingesteld ? CFG.repo.split('/')[1] : 'de repo'; });
+    document.querySelectorAll('[data-repo-link]').forEach(el => {
+        el.textContent = ingesteld ? CFG.repo : '(nog niet ingesteld)';
+        if (ingesteld) {
+            el.href = `https://github.com/${CFG.repo}`;
+        }
+    });
+}
+
+function toonUrls() {
+    const lijst = $('urllijst');
+    lijst.replaceChildren();
+    for (const [label, pad] of [['Scholingen', BESTAND_SCHOLINGEN], ['Inschrijvingen', BESTAND_INSCHRIJVINGEN]]) {
+        const rij = Object.assign(document.createElement('div'), {className: 'url'});
+        const veld = Object.assign(document.createElement('input'), {type: 'text', readOnly: true, value: rawUrl(pad)});
+        veld.addEventListener('focus', () => veld.select());
+        const knop = Object.assign(document.createElement('button'), {type: 'button', className: 'klein', textContent: 'Kopiëren'});
+        knop.addEventListener('click', async () => {
+            veld.select();
+            try {
+                await navigator.clipboard.writeText(veld.value);
+            } catch (e) {
+                document.execCommand('copy');
+            }
+            knop.textContent = 'Gekopieerd';
+            setTimeout(() => { knop.textContent = 'Kopiëren'; }, 1500);
+        });
+        rij.append(Object.assign(document.createElement('span'), {textContent: label}), veld, knop);
+        lijst.append(rij);
+    }
+    $('geschiedenis').href = `https://github.com/${CFG.repo}/commits/${CFG.branch}`;
+    $('urls').hidden = false;
+}
+
+start();
+</script>
+</body>
+</html>
